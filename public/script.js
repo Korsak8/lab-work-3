@@ -1,75 +1,122 @@
-let offset = 0;
-let arr_offsets = [];
+// Ініціалізація змінних для зсуву та статистики
+let offset = 0; // Зсув часу, обчислений власним методом
+let arr_offsets = []; // Масив зсувів, отриманих власним методом
+let arr_timesync_offsets = []; // Масив зсувів, отриманих бібліотекою timesync
+let methodError = 0; // Похибка між нашим методом та timesync
+let isCollecting = true; // Прапорець, що вказує, чи триває збір даних
 
-// Ініціалізація timesync
+// Створення об'єкта timesync з сервером і без повторної синхронізації
 const ts = timesync.create({
     server: '/timesync',
     repeat: 0
 });
 
-// Подія синхронізації
-ts.on('sync', function () {
+// Обробник події синхронізації бібліотеки timesync
+ts.on('sync', function() {
+    // Перевірка, чи значення зсуву коректне
     if (typeof ts.offset !== 'number' || isNaN(ts.offset)) {
         console.error("Помилка: timesync повернув NaN!");
         document.getElementById('syncError').innerText = `Помилка: timesync повернув NaN!`;
-        document.getElementById('syncError').className = 'status-box error-box';
         return;
     }
 
-    const error = Math.abs(offset - ts.offset);
-    console.log("Похибка методу:", error);
+    // Додавання зсуву до масиву, якщо ще триває збір і не перевищено ліміт
+    if (isCollecting && arr_timesync_offsets.length < 60) {
+        arr_timesync_offsets.push(ts.offset);
+    }
 
-    document.getElementById('syncError').innerText = `Похибка методу: ${error.toFixed(2)} мс`;
-    document.getElementById('syncError').className = 'status-box error-box';
+    // Розрахунок поточної похибки між методами
+    const currentError = Math.abs(offset - ts.offset);
+    console.log("Поточна похибка методу:", currentError);
+
+    // Виведення поточної похибки та загальної похибки методу в інтерфейс
+    document.getElementById('currentErrorStat').textContent = `${currentError.toFixed(2)} мс`;
+    document.getElementById('syncError').innerHTML = `
+        <strong>Поточна похибка методу:</strong> ${currentError.toFixed(2)} мс<br>
+        <strong>Похибка методу:</strong> ${methodError.toFixed(2)} мс
+    `;
 });
 
-// Отримання статистики
-function fetchData() {
-    try {
-        const stats = calculateStats(arr_offsets);
-        document.getElementById('output').innerHTML = formatStats(stats);
-    } catch (error) {
-        document.getElementById('output').innerHTML = '<div class="metric-card"><div class="metric-title">Помилка</div><div class="metric-value">0</div></div>';
-        console.error('Помилка:', error);
-    }
-}
-
-// Функція для синхронізації часу
+// Основна функція синхронізації часу за власним методом
 async function syncTime() {
     try {
+        // Якщо починається новий збір — скидаємо попередні дані
+        if (!isCollecting) {
+            arr_offsets = [];
+            arr_timesync_offsets = [];
+            isCollecting = true;
+            document.getElementById('timeOutput').textContent = "Початок нового збору даних...";
+            document.getElementById('syncError').textContent = "";
+        }
+
+        // Замір часу перед і після запиту до сервера
         const start = performance.now();
         const response = await fetch('/time', { method: 'GET' });
         const end = performance.now();
 
+        // Обробка помилки відповіді сервера
         if (!response.ok) throw new Error(`HTTP помилка: ${response.status}`);
 
+        // Отримання серверного часу з відповіді
         const { result: serverTime } = await response.json();
-        const roundTripTime = end - start;
-        const estimatedClientTime = serverTime + roundTripTime / 2;
-        offset = estimatedClientTime - Date.now();
+        const roundTripTime = end - start; // Час на запит у дві сторони
+        const estimatedClientTime = serverTime + roundTripTime / 2; // Оцінка поточного клієнтського часу
+        offset = estimatedClientTime - Date.now(); // Розрахунок зсуву
 
-        if (arr_offsets.length > 100) arr_offsets = [];
-        arr_offsets.push(offset);
+        // Якщо ще збираємо дані — додаємо зсув до масиву
+        if (isCollecting) {
+            if (arr_offsets.length < 60) {
+                arr_offsets.push(offset);
+            } else {
+                isCollecting = false;
+                document.getElementById('timeOutput').textContent = `Збір даних завершено. Натисніть кнопку для нового збору.`;
+                document.getElementById('syncError').textContent = "Досягнуто максимальної кількості даних (30). Натисніть кнопку для нового збору.";
+            }
+        }
 
+        // Оновлення статистичних показників
+        updateStats();
+
+        // Виклик синхронізації бібліотеки timesync
         ts.sync();
 
-        document.getElementById('timeOutput').innerText = `Поточна поправка часу: ${offset.toFixed(2)} мс`;
-        document.getElementById('timeOutput').className = 'status-box';
-        fetchData();
+        // Виведення останнього зсуву, якщо ще йде збір
+        if (isCollecting) {
+            document.getElementById('offsetStat').textContent = `${offset.toFixed(2)} мс`;
+        }
 
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        syncTime();
+        // Коли обидва масиви заповнені — обчислюємо похибку методу
+        if (arr_offsets.length === 60 && arr_timesync_offsets.length === 60) {
+            const yourStats = calculateStats(arr_offsets);
+            const timesyncStats = calculateStats(arr_timesync_offsets);
+            methodError = Math.abs(yourStats.mode - timesyncStats.mode);
+            document.getElementById('methodErrorStat').textContent = `${methodError.toFixed(2)} мс`;
+        }
+
+        // Повторний запуск функції через 1 секунду, якщо ще збираємо
+        if (isCollecting) {
+            setTimeout(syncTime, 1000);
+        }
+
     } catch (error) {
-        document.getElementById('timeOutput').innerText = 'Помилка синхронізації';
-        document.getElementById('timeOutput').className = 'status-box error-box';
+        // Обробка помилки запиту
+        document.getElementById('timeOutput').textContent = 'Помилка синхронізації';
+        document.getElementById('syncError').textContent = error.message;
         console.error('Помилка:', error);
     }
 }
 
-// Обчислення статистичних показників
+// Оновлення статистики в інтерфейсі
+function updateStats() {
+    const stats = calculateStats(arr_offsets);
+    document.getElementById('countStat').textContent = arr_offsets.length;
+    document.getElementById('output').textContent = formatStats(stats);
+}
+
+// Розрахунок статистичних характеристик з масиву значень
 function calculateStats(arr) {
     if (!arr.length) return {};
-    
+
     arr.sort((a, b) => a - b);
     const min = arr[0];
     const max = arr[arr.length - 1];
@@ -87,7 +134,7 @@ function calculateStats(arr) {
     return { min, q1, median, q3, max, avg, mode, stddev, iqr };
 }
 
-// Пошук моди (найчастішого значення)
+// Пошук моди (найчастіше зустрічаємого значення) в масиві
 function findMode(arr) {
     const freq = {};
     arr.forEach(num => freq[num] = (freq[num] || 0) + 1);
@@ -102,77 +149,20 @@ function findMode(arr) {
     return mode;
 }
 
-// Форматування статистики для виводу
+// Форматування статистики для виводу на екран
 function formatStats(stats) {
-    if (arr_offsets.length === 0) {
-        return `
-            <div class="metric-card">
-                <div class="metric-title">Немає даних</div>
-                <div class="metric-value">0</div>
-                <span class="metric-unit">мс</span>
-            </div>
-        `;
-    }
-    
-    return `
-        <div class="metric-card">
-            <div class="metric-title">Кількість вимірів</div>
-            <div class="metric-value">${arr_offsets.length}</div>
-        </div>
-        <div class="metric-card">
-            <div class="metric-title">Поточна поправка</div>
-            <div class="metric-value">${offset.toFixed(2)}</div>
-            <span class="metric-unit">мс</span>
-        </div>
-        <div class="metric-card">
-            <div class="metric-title">Мінімум</div>
-            <div class="metric-value">${stats.min.toFixed(2)}</div>
-            <span class="metric-unit">мс</span>
-        </div>
-        <div class="metric-card">
-            <div class="metric-title">Q1</div>
-            <div class="metric-value">${stats.q1.toFixed(2)}</div>
-            <span class="metric-unit">мс</span>
-        </div>
-        <div class="metric-card">
-            <div class="metric-title">Медіана</div>
-            <div class="metric-value">${stats.median.toFixed(2)}</div>
-            <span class="metric-unit">мс</span>
-        </div>
-        <div class="metric-card">
-            <div class="metric-title">Середнє</div>
-            <div class="metric-value">${stats.avg.toFixed(2)}</div>
-            <span class="metric-unit">мс</span>
-        </div>
-        <div class="metric-card">
-            <div class="metric-title">Мода</div>
-            <div class="metric-value">${stats.mode.toFixed(2)}</div>
-            <span class="metric-unit">мс</span>
-        </div>
-        <div class="metric-card">
-            <div class="metric-title">Q3</div>
-            <div class="metric-value">${stats.q3.toFixed(2)}</div>
-            <span class="metric-unit">мс</span>
-        </div>
-        <div class="metric-card">
-            <div class="metric-title">Максимум</div>
-            <div class="metric-value">${stats.max.toFixed(2)}</div>
-            <span class="metric-unit">мс</span>
-        </div>
-        <div class="metric-card">
-            <div class="metric-title">Стандартне відхилення</div>
-            <div class="metric-value">${stats.stddev.toFixed(2)}</div>
-            <span class="metric-unit">мс</span>
-        </div>
-        <div class="metric-card">
-            <div class="metric-title">IQR</div>
-            <div class="metric-value">${stats.iqr.toFixed(2)}</div>
-            <span class="metric-unit">мс</span>
-        </div>
-    `;
+    return `Min: ${stats.min.toFixed(2)} мс
+Q1: ${stats.q1.toFixed(2)} мс
+Медіана: ${stats.median.toFixed(2)} мс
+Середнє: ${stats.avg.toFixed(2)} мс
+Мода: ${stats.mode.toFixed(2)} мс
+Q3: ${stats.q3.toFixed(2)} мс
+Max: ${stats.max.toFixed(2)} мс
+Стандартне відхилення: ${stats.stddev.toFixed(2)} мс
+IQR: ${stats.iqr.toFixed(2)} мс`;
 }
 
-// Ініціалізація інтерфейсу
-document.addEventListener('DOMContentLoaded', function() {
-    fetchData();
+// Обробник події завантаження сторінки — оновлює статистику при старті
+document.addEventListener('DOMContentLoaded', () => {
+    updateStats();
 });
